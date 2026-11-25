@@ -1,0 +1,300 @@
+---
+- name: Deploy the monitoring application
+  hosts: monitoring
+  gather_facts: true
+  become: false
+  vars:
+    app_user: monitoring
+    app_group: monitoring
+    app_home: /var/lib/monitoring
+    monitoring_remote_tmp: /var/lib/monitoring/.ansible/tmp
+    app_dir: /opt/monitoring_application
+    app_bind_host: 0.0.0.0
+    app_health_host: 127.0.0.1
+    app_port: 5000
+    app_repo: https://github.com/fairozb/cursor_monitoring_application.git
+    app_version: main
+  vars_prompt:
+    - name: app_secret_key
+      prompt: SECRET_KEY (press Enter to keep the existing value)
+      private: true
+      unsafe: true
+      confirm: true
+      default: ""
+    - name: app_admin_password
+      prompt: ADMIN_PASSWORD (press Enter to keep the existing value)
+      private: true
+      unsafe: true
+      confirm: true
+      default: ""
+
+  tasks:
+    - name: Show the detected Linux distribution
+      ansible.builtin.debug:
+        msg: >-
+          {{ ansible_distribution }} {{ ansible_distribution_version }}
+          (family {{ ansible_os_family }})
+
+    - name: Require a Debian or Red Hat family distribution
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family in ['Debian', 'RedHat']
+        fail_msg: >-
+          {{ ansible_distribution }} (family {{ ansible_os_family }}) is not
+          supported. This playbook supports Debian and Red Hat family
+          distributions only.
+
+    - name: Install Debian family packages
+      ansible.builtin.apt:
+        name:
+          - git
+          - python3
+          - python3-pip
+          - python3-venv
+          - ca-certificates
+          - build-essential
+          - python3-dev
+          - libffi-dev
+          - libssl-dev
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      when: ansible_os_family == "Debian"
+
+    - name: Install Red Hat family packages
+      ansible.builtin.package:
+        name:
+          - git
+          - python3
+          - python3-pip
+          - ca-certificates
+          - gcc
+          - python3-devel
+          - libffi-devel
+          - openssl-devel
+        state: present
+      when: ansible_os_family == "RedHat"
+
+    - name: Read the Python 3 version
+      ansible.builtin.command:
+        cmd: python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])'
+      register: python_version
+      changed_when: false
+
+    - name: Require Python 3.9 or newer
+      ansible.builtin.assert:
+        that:
+          - python_version.stdout is version('3.9', '>=')
+        fail_msg: >-
+          Python {{ python_version.stdout }} is installed. Flask 3.1 requires
+          Python 3.9 or newer.
+
+    - name: Create the monitoring service user
+      ansible.builtin.user:
+        name: "{{ app_user }}"
+        system: true
+        shell: /usr/sbin/nologin
+        home: "{{ app_home }}"
+        create_home: true
+        move_home: false
+
+    - name: Set ownership and mode on the service user home
+      ansible.builtin.file:
+        path: "{{ app_home }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0750"
+
+    - name: Create the Ansible remote temporary directory
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0700"
+      loop:
+        - "{{ app_home }}/.ansible"
+        - "{{ monitoring_remote_tmp }}"
+
+    - name: Create the application directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0750"
+
+    - name: Remove leftover Ansible temp files from the application directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}/.ansible"
+        state: absent
+
+    - name: Check for an existing Git checkout
+      ansible.builtin.stat:
+        path: "{{ app_dir }}/.git"
+      register: app_git
+
+    - name: List top-level entries in the application directory
+      ansible.builtin.find:
+        paths: "{{ app_dir }}"
+        file_type: any
+        hidden: true
+        recurse: false
+      register: app_dir_entries
+
+    - name: Require an empty application directory or an existing Git checkout
+      ansible.builtin.assert:
+        that:
+          - app_dir_entries.matched | int == 0 or app_git.stat.exists
+        fail_msg: >-
+          {{ app_dir }} is not empty and has no Git checkout. Only
+          {{ app_dir }}/.ansible was removed. Databases, credentials, and
+          other application files were left in place.
+
+    - name: Install the application code and Python environment
+      become: true
+      become_user: "{{ app_user }}"
+      vars:
+        ansible_remote_tmp: "{{ monitoring_remote_tmp }}"
+      block:
+        - name: Clone the monitoring application
+          ansible.builtin.git:
+            repo: "{{ app_repo }}"
+            dest: "{{ app_dir }}"
+            version: "{{ app_version }}"
+            update: true
+          notify: Restart monitoring-app
+
+        - name: Create the Python virtual environment
+          ansible.builtin.command:
+            cmd: python3 -m venv {{ app_dir }}/.venv
+            creates: "{{ app_dir }}/.venv/bin/python"
+
+        - name: Install Python dependencies
+          ansible.builtin.pip:
+            requirements: "{{ app_dir }}/requirements.txt"
+            virtualenv: "{{ app_dir }}/.venv"
+            virtualenv_command: python3 -m venv
+          notify: Restart monitoring-app
+
+    - name: Check for an existing environment file
+      ansible.builtin.stat:
+        path: "{{ app_dir }}/.env"
+      register: env_file
+
+    - name: Reject a partial secret update
+      ansible.builtin.assert:
+        that:
+          - (app_secret_key | length > 0) == (app_admin_password | length > 0)
+        fail_msg: >-
+          Provide both SECRET_KEY and ADMIN_PASSWORD, or leave both blank to
+          keep the existing .env file.
+
+    - name: Require secrets on the first deployment
+      ansible.builtin.assert:
+        that:
+          - app_secret_key | length > 0
+          - app_admin_password | length > 0
+        fail_msg: >-
+          SECRET_KEY and ADMIN_PASSWORD are required when {{ app_dir }}/.env
+          does not exist. Re-run and enter both values at the prompts.
+      when: not env_file.stat.exists
+
+    - name: Write the application environment file
+      ansible.builtin.copy:
+        dest: "{{ app_dir }}/.env"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0600"
+        content: |
+          SECRET_KEY="{{ app_secret_key | regex_replace('[\r\n]', '') | replace('\\', '\\\\') | replace('"', '\\"') }}"
+          ADMIN_PASSWORD="{{ app_admin_password | regex_replace('[\r\n]', '') | replace('\\', '\\\\') | replace('"', '\\"') }}"
+          FLASK_HOST={{ app_bind_host }}
+          FLASK_PORT={{ app_port }}
+          DEMO_MODE=false
+      when:
+        - app_secret_key | length > 0
+        - app_admin_password | length > 0
+      no_log: true
+      notify: Restart monitoring-app
+
+    - name: Set the application bind address without changing secrets
+      ansible.builtin.lineinfile:
+        path: "{{ app_dir }}/.env"
+        regexp: '^FLASK_HOST\s*='
+        line: "FLASK_HOST={{ app_bind_host }}"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0600"
+      notify: Restart monitoring-app
+
+    - name: Set the application port without changing secrets
+      ansible.builtin.lineinfile:
+        path: "{{ app_dir }}/.env"
+        regexp: '^FLASK_PORT\s*='
+        line: "FLASK_PORT={{ app_port }}"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0600"
+      notify: Restart monitoring-app
+
+    - name: Install the monitoring-app systemd unit
+      ansible.builtin.template:
+        src: monitoring-app.service.j2
+        dest: /etc/systemd/system/monitoring-app.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart monitoring-app
+
+    - name: Enable and start monitoring-app
+      ansible.builtin.systemd:
+        name: monitoring-app
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Flush restart handlers before health checks
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for the application port
+      ansible.builtin.wait_for:
+        host: "{{ app_health_host }}"
+        port: "{{ app_port }}"
+        delay: 2
+        timeout: 30
+        state: started
+
+    - name: Check the login page
+      ansible.builtin.uri:
+        url: "http://{{ app_health_host }}:{{ app_port }}/login"
+        status_code: 200
+        return_content: false
+      register: health_check
+
+    - name: Confirm monitoring-app is active
+      ansible.builtin.command: systemctl is-active monitoring-app
+      register: service_state
+      changed_when: false
+
+    - name: Read sockets listening on port 5000
+      ansible.builtin.command: ss -H -ltn sport = :5000
+      register: listen_sockets
+      changed_when: false
+
+    - name: Require an available application
+      ansible.builtin.assert:
+        that:
+          - service_state.stdout == "active"
+          - health_check.status == 200
+          - listen_sockets.stdout is search('(^|\s)0\.0\.0\.0:5000(\s|$)')
+        fail_msg: >-
+          monitoring-app is not available on {{ app_bind_host }}:{{ app_port }}.
+
+  handlers:
+    - name: Restart monitoring-app
+      ansible.builtin.systemd:
+        name: monitoring-app
+        state: restarted
+        daemon_reload: true

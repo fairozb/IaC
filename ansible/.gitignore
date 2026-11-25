@@ -1,0 +1,10 @@
+*.retry
+.ansible/
+*.log
+.vault_pass
+*.pem
+*.key
+.env
+inventory.local.ini
+secrets*
+**/secrets*

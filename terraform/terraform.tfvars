@@ -1,0 +1,5 @@
+aws_region        = "us-east-1"
+availability_zone = "us-east-1f"
+instance_type     = "t3.micro"
+ami_id            = "ami-0fbc7ac82ff7690bc"
+instance_name     = "fairoz-demo"
